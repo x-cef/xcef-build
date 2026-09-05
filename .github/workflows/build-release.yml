@@ -1,0 +1,71 @@
+name: Build XCef release
+run-name: XCef ${{ github.event.client_payload.source_tag || inputs.source_tag }}
+
+on:
+  repository_dispatch:
+    types: [xcef-tag]
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: XCef release to build or update
+        required: true
+        type: string
+      cef_packages:
+        description: JSON array of stable standard CEF SDK archive filenames
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.client_payload.source_tag || inputs.source_tag }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      # GitHub only lists draft releases for callers with push access.
+      # Preparation performs reads only, but must see the same releases as publish.
+      contents: write
+    outputs:
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v6
+        with:
+          repository: x-cef/XCef
+          token: ${{ secrets.XCEF_AUTOMATION_TOKEN }}
+          ref: refs/tags/${{ github.event.client_payload.source_tag || inputs.source_tag }}
+          path: source
+          persist-credentials: false
+      - name: Validate source, release and SDK package availability
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release.py prepare
+
+  package:
+    needs: prepare
+    name: CEF ${{ matrix.cef_version }} - ${{ matrix.platform }}-${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    uses: ./.github/workflows/build-package.yml
+    permissions:
+      contents: write
+    with:
+      plan: ${{ needs.prepare.outputs.plan }}
+      target: ${{ toJSON(matrix) }}
+    secrets:
+      XCEF_AUTOMATION_TOKEN: ${{ secrets.XCEF_AUTOMATION_TOKEN }}

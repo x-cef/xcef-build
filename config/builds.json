@@ -1,0 +1,11 @@
+{
+  "cef_versions": [
+    {"major": 151, "version": "151.3.24+g2384915+chromium-151.0.7922.174"}
+  ],
+  "targets": [
+    {"platform": "windows", "architecture": "x64", "runner": "windows-latest", "cef_platform": "windows64"},
+    {"platform": "linux", "architecture": "x64", "runner": "ubuntu-latest", "cef_platform": "linux64"},
+    {"platform": "macos", "architecture": "arm64", "runner": "macos-15", "cef_platform": "macosarm64", "xcode_path": "/Applications/Xcode_16.4.app/Contents/Developer"},
+    {"platform": "macos", "architecture": "x64", "runner": "macos-15-intel", "cef_platform": "macosx64", "xcode_path": "/Applications/Xcode_16.4.app/Contents/Developer"}
+  ]
+}
