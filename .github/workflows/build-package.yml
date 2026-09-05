@@ -1,0 +1,158 @@
+name: Build and publish one SDK
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+    secrets:
+      XCEF_AUTOMATION_TOKEN:
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    name: CEF ${{ fromJSON(inputs.target).cef_version }} -- ${{ fromJSON(inputs.target).platform }}-${{ fromJSON(inputs.target).architecture }}
+    runs-on: ${{ fromJSON(inputs.target).runner }}
+    env:
+      BUILD_PLAN: ${{ inputs.plan }}
+      BUILD_TARGET: ${{ inputs.target }}
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v6
+        with:
+          repository: x-cef/XCef
+          token: ${{ secrets.XCEF_AUTOMATION_TOKEN }}
+          ref: ${{ fromJSON(inputs.plan).source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Resolve dependencies
+        id: dependencies
+        env:
+          CEF_VERSION: ${{ fromJSON(inputs.target).cef_version }}
+        shell: bash
+        run: python source/scripts/resolve_dependency_versions.py --cef-sdk-version "$CEF_VERSION" --ci-output
+      # Cache only the archive, not a duplicate extracted SDK. CMake extracts it.
+      - name: Cache CEF archive
+        uses: actions/cache@v5
+        with:
+          path: source/.build/${{ fromJSON(inputs.target).platform }}.${{ fromJSON(inputs.target).architecture }}/_deps/cef_binary_${{ fromJSON(inputs.target).cef_version }}_*.tar.bz2
+          key: cef-archive-v1-${{ runner.os }}-${{ fromJSON(inputs.target).architecture }}-${{ fromJSON(inputs.target).cef_version }}
+      # Independent source caches avoid invalidating every library on one upgrade.
+      # Never cache toolchain-dependent CMake build/subbuild directories.
+      - name: Cache Boost sources
+        uses: actions/cache@v5
+        with:
+          path: source/.build/${{ fromJSON(inputs.target).platform }}.${{ fromJSON(inputs.target).architecture }}/_deps/boost-src
+          key: boost-src-v1-${{ runner.os }}-${{ fromJSON(inputs.target).architecture }}-${{ steps.dependencies.outputs.boost_version }}
+      - name: Cache msgpack sources
+        uses: actions/cache@v5
+        with:
+          path: source/.build/${{ fromJSON(inputs.target).platform }}.${{ fromJSON(inputs.target).architecture }}/_deps/msgpack-cxx-src
+          key: msgpack-src-v1-${{ runner.os }}-${{ fromJSON(inputs.target).architecture }}-${{ steps.dependencies.outputs.msgpack_version }}
+      - name: Cache spdlog sources
+        uses: actions/cache@v5
+        with:
+          path: source/.build/${{ fromJSON(inputs.target).platform }}.${{ fromJSON(inputs.target).architecture }}/_deps/spdlog-src
+          key: spdlog-src-v1-${{ runner.os }}-${{ fromJSON(inputs.target).architecture }}-${{ steps.dependencies.outputs.spdlog_version }}
+      - name: Initialize MSVC x64 environment
+        if: fromJSON(inputs.target).platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+      - name: Install sccache for Windows Ninja preset
+        if: fromJSON(inputs.target).platform == 'windows'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Verify Windows build tools
+        if: fromJSON(inputs.target).platform == 'windows'
+        shell: pwsh
+        run: |
+          Get-Command cl.exe, link.exe, rc.exe, ninja.exe, sccache.exe -ErrorAction Stop |
+            Select-Object Name, Source
+          "CC=cl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CXX=cl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          sccache --version
+          if ($LASTEXITCODE -ne 0) { throw 'sccache is not executable' }
+      - name: Build SDK and verify package metadata
+        shell: python
+        run: |
+          import json, os, subprocess, sys
+          from pathlib import Path
+          row = json.loads(os.environ['BUILD_TARGET'])
+          output = Path(os.environ['RUNNER_TEMP']) / 'xcefsdk'
+          command = [sys.executable, 'source/scripts/build_sdk.py',
+                     '--platform', row['platform'], '--arch', row['architecture'],
+                     '--configuration', 'Release', '--cef-sdk-version', row['cef_version'],
+                     '--output-dir', str(output)]
+          if row['platform'] == 'linux':
+              command.append('--install-system-dependencies')
+          if row.get('xcode_path'):
+              command.extend(['--xcode-path', row['xcode_path']])
+          subprocess.run(command, check=True)
+          subprocess.run([sys.executable, 'scripts/release.py', 'stage',
+                          '--packages', str(output / 'packages'), '--output', '.work/staged'], check=True)
+      - name: Show Windows compilation cache statistics
+        if: always() && fromJSON(inputs.target).platform == 'windows'
+        run: sccache --show-stats
+      - name: Upload SDK ZIP with package identity
+        uses: actions/upload-artifact@v7
+        with:
+          path: .work/staged/*.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Upload package metadata
+        uses: actions/upload-artifact@v7
+        with:
+          path: .work/staged/xcef-*.json
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    needs: build
+    concurrency:
+      group: publish-${{ fromJSON(inputs.plan).release_tag }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Download SDK ZIPs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: xcef-*-${{ fromJSON(inputs.target).cef_version }}-${{ fromJSON(inputs.target).platform }}-${{ fromJSON(inputs.target).architecture }}.zip
+          path: .work/assets
+          merge-multiple: true
+          skip-decompress: true
+      - name: Download package metadata
+        uses: actions/download-artifact@v8
+        with:
+          pattern: xcef-*-${{ fromJSON(inputs.target).cef_version }}-${{ fromJSON(inputs.target).platform }}-${{ fromJSON(inputs.target).architecture }}.json
+          path: .work/assets
+          merge-multiple: true
+          skip-decompress: true
+      - name: Verify and publish this SDK package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_TARGET: ${{ inputs.target }}
+          BUILD_PLAN: ${{ inputs.plan }}
+        run: python scripts/release.py finalize --directory .work/assets
